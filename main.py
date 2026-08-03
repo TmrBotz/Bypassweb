@@ -1,7 +1,7 @@
 """
 CF Bypass Scraper API — Free Tier Edition
-Only cloudscraper (no Playwright, no browser)
-Works perfectly on Render Free Plan
+cloudscraper only, no browser, Render Free compatible
+Pydantic v1 + html.parser (no lxml/Rust needed)
 """
 
 import asyncio
@@ -10,7 +10,6 @@ import logging
 import random
 import re
 import time
-from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import cloudscraper
@@ -29,16 +28,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ──────────────────────────────────────────────
-# Browser profiles to rotate
-# ──────────────────────────────────────────────
 BROWSER_PROFILES = [
     {"browser": "chrome",  "platform": "windows", "mobile": False},
     {"browser": "chrome",  "platform": "linux",   "mobile": False},
     {"browser": "firefox", "platform": "windows", "mobile": False},
     {"browser": "firefox", "platform": "linux",   "mobile": False},
-    {"browser": "chrome",  "platform": "android", "mobile": True},
 ]
 
 DEFAULT_HEADERS = {
@@ -49,22 +43,10 @@ DEFAULT_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-
-# ──────────────────────────────────────────────
-# Lifespan
-# ──────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 CF Bypass API (Free Tier) starting...")
-    yield
-    logger.info("🛑 Shutting down...")
-
-
 app = FastAPI(
     title="CF Bypass Scraper API",
-    description="Cloudflare bypass via cloudscraper — Free Tier compatible",
-    version="2.0.0",
-    lifespan=lifespan,
+    description="Cloudflare bypass via cloudscraper — Render Free compatible",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -75,33 +57,37 @@ app.add_middleware(
 )
 
 
-# ──────────────────────────────────────────────
-# Models
-# ──────────────────────────────────────────────
+# ── Models (Pydantic v1 style) ─────────────────
 class ScrapeRequest(BaseModel):
     url: str
     method: str = "GET"
     post_data: Optional[dict] = None
     headers: Optional[dict] = None
     cookies: Optional[dict] = None
-    extract_selector: Optional[str] = None   # CSS selector to extract
+    extract_selector: Optional[str] = None
     return_html: bool = True
     return_text: bool = False
     return_json: bool = False
     timeout: int = 30
 
+class BatchRequest(BaseModel):
+    urls: list
+    extract_selector: Optional[str] = None
+    return_html: bool = True
+    return_text: bool = False
+    timeout: int = 30
+    concurrency: int = 3
 
-# ──────────────────────────────────────────────
-# Core scraper
-# ──────────────────────────────────────────────
+
+# ── Core Scraper ───────────────────────────────
 def _do_scrape(req: ScrapeRequest) -> dict:
     profile = random.choice(BROWSER_PROFILES)
     scraper = cloudscraper.create_scraper(browser=profile, delay=5)
 
-    headers = {**DEFAULT_HEADERS}
+    hdrs = {**DEFAULT_HEADERS}
     if req.headers:
-        headers.update(req.headers)
-    scraper.headers.update(headers)
+        hdrs.update(req.headers)
+    scraper.headers.update(hdrs)
 
     if req.cookies:
         scraper.cookies.update(req.cookies)
@@ -112,9 +98,8 @@ def _do_scrape(req: ScrapeRequest) -> dict:
         else:
             resp = scraper.get(req.url, timeout=req.timeout)
 
-        # CF still blocking?
         if resp.status_code == 403 and "cloudflare" in resp.text.lower():
-            return {"success": False, "error": "CF 403 — site uses Turnstile (needs paid plan with Playwright)", "status_code": 403}
+            return {"success": False, "error": "CF 403 blocked — site needs Turnstile bypass (paid plan)", "status_code": 403}
         if resp.status_code == 503 and "Just a moment" in resp.text:
             return {"success": False, "error": "CF 503 IUAM — cloudscraper could not bypass", "status_code": 503}
 
@@ -124,32 +109,30 @@ def _do_scrape(req: ScrapeRequest) -> dict:
             "status_code": resp.status_code,
             "html": html,
             "cookies": dict(scraper.cookies),
-            "headers": dict(resp.headers),
         }
 
-        # ── CSS Extraction ─────────────────────────
+        # CSS Extraction (html.parser — no lxml needed)
         if req.extract_selector:
             try:
-                soup = BeautifulSoup(html, "lxml")
+                soup = BeautifulSoup(html, "html.parser")
                 elems = soup.select(req.extract_selector)
                 result["extracted"] = "\n".join(e.get_text(strip=True) for e in elems) if elems else None
             except Exception as e:
                 result["extracted"] = None
                 logger.warning(f"CSS extract failed: {e}")
 
-        # ── Plain Text ────────────────────────────
+        # Plain text
         if req.return_text:
             try:
-                soup = BeautifulSoup(html, "lxml")
+                soup = BeautifulSoup(html, "html.parser")
                 for tag in soup(["script", "style", "noscript", "meta", "link"]):
                     tag.decompose()
                 text = soup.get_text(separator="\n", strip=True)
                 result["text"] = re.sub(r"\n{3,}", "\n\n", text)
             except Exception as e:
                 result["text"] = None
-                logger.warning(f"Text extract failed: {e}")
 
-        # ── JSON Parse ────────────────────────────
+        # JSON parse
         if req.return_json:
             try:
                 result["json_data"] = json.loads(html)
@@ -160,7 +143,6 @@ def _do_scrape(req: ScrapeRequest) -> dict:
                 except Exception:
                     result["json_data"] = None
 
-        # Drop HTML if not needed
         if not req.return_html:
             result["html"] = None
 
@@ -168,29 +150,24 @@ def _do_scrape(req: ScrapeRequest) -> dict:
         return result
 
     except cloudscraper.exceptions.CloudflareChallengeError as e:
-        return {"success": False, "error": f"CF challenge unsolvable by cloudscraper: {e}"}
+        return {"success": False, "error": f"CF challenge unsolvable: {e}"}
     except requests.exceptions.Timeout:
         return {"success": False, "error": f"Timeout after {req.timeout}s"}
-    except requests.exceptions.ConnectionError as e:
-        return {"success": False, "error": f"Connection error: {e}"}
     except Exception as e:
-        return {"success": False, "error": f"Unexpected: {e}"}
+        return {"success": False, "error": str(e)}
 
 
 async def scrape_async(req: ScrapeRequest) -> dict:
-    """Run blocking cloudscraper in thread pool."""
     return await asyncio.to_thread(_do_scrape, req)
 
 
-# ──────────────────────────────────────────────
-# Endpoints
-# ──────────────────────────────────────────────
+# ── Endpoints ──────────────────────────────────
 @app.get("/")
 async def root():
     return {
         "status": "online",
         "service": "CF Bypass Scraper API (Free Tier)",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "engine": "cloudscraper",
         "endpoints": {
             "browser_test": "GET  /target?url=https://site.com",
@@ -198,21 +175,14 @@ async def root():
             "batch":        "POST /scrape/batch",
             "health":       "GET  /health",
         },
-        "params": {
-            "/target": "url, extract (CSS selector), text (bool), timeout",
-            "/scrape":  "url, method, post_data, headers, cookies, extract_selector, return_html, return_text, return_json, timeout",
-        }
     }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "timestamp": int(time.time()), "engine": "cloudscraper"}
+    return {"status": "healthy", "timestamp": int(time.time())}
 
 
-# ──────────────────────────────────────────────
-# GET /target — browser friendly
-# ──────────────────────────────────────────────
 @app.get("/target")
 async def target_get(
     url: str,
@@ -236,7 +206,6 @@ async def target_get(
     result["elapsed_ms"] = int((time.time() - start) * 1000)
     result["url"] = url
 
-    # Clean response for browser readability
     if extract and result.get("extracted") is not None:
         result.pop("html", None)
     elif text and result.get("text"):
@@ -245,9 +214,6 @@ async def target_get(
     return JSONResponse(content=result)
 
 
-# ──────────────────────────────────────────────
-# POST /scrape
-# ──────────────────────────────────────────────
 @app.post("/scrape")
 async def scrape(req: ScrapeRequest):
     start = time.time()
@@ -255,18 +221,6 @@ async def scrape(req: ScrapeRequest):
     result["elapsed_ms"] = int((time.time() - start) * 1000)
     result["url"] = req.url
     return JSONResponse(content=result)
-
-
-# ──────────────────────────────────────────────
-# POST /scrape/batch
-# ──────────────────────────────────────────────
-class BatchRequest(BaseModel):
-    urls: list[str]
-    extract_selector: Optional[str] = None
-    return_html: bool = True
-    return_text: bool = False
-    timeout: int = 30
-    concurrency: int = 3
 
 
 @app.post("/scrape/batch")
@@ -297,6 +251,5 @@ async def batch_scrape(req: BatchRequest):
     }
 
 
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
