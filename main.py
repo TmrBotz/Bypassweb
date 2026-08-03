@@ -35,8 +35,12 @@ class ScrapeResponse(BaseModel):
     links: list[DownloadLink]
 
 @app.get("/")
-def root():
-    return {"status": "ok", "message": "FilesDL Scraper API is running!"}
+async def root(url: str = None):
+    if not url:
+        return {"status": "ok", "message": "FilesDL Scraper API is running! Use /?url=YOUR_URL"}
+    
+    # Reuse scrape logic
+    return await scrape_links(ScrapeRequest(url=url))
 
 @app.post("/scrape", response_model=ScrapeResponse)
 async def scrape_links(request: ScrapeRequest):
