@@ -45,7 +45,7 @@ DEFAULT_HEADERS = {
 app = FastAPI(
     title="CF Bypass Scraper API",
     description="Cloudflare bypass via cloudscraper — Render Free compatible",
-    version="2.2.0",
+    version="2.3.0",
 )
 
 app.add_middleware(
@@ -157,15 +157,80 @@ async def scrape_async(req: ScrapeRequest) -> dict:
     return await asyncio.to_thread(_do_scrape, req)
 
 
+# ── FilesdL Parser ─────────────────────────────
+def parse_filesdl(html: str, url: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    body_text = soup.get_text(separator="\n", strip=True)
+
+    # Filename — first meaningful line or <title>
+    filename = None
+    title_tag = soup.find("title")
+    if title_tag:
+        filename = title_tag.get_text(strip=True)
+
+    # Size
+    size = None
+    size_match = re.search(r"Size[:\s]+([0-9.,]+\s*(?:MB|GB|KB))", body_text, re.IGNORECASE)
+    if size_match:
+        size = size_match.group(1).strip()
+
+    # Date
+    date = None
+    date_match = re.search(r"Date[:\s]+(\d{4}-\d{2}-\d{2}[^\n]*)", body_text)
+    if date_match:
+        date = date_match.group(1).strip()
+
+    # All links with labels
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        label = a.get_text(strip=True)
+        if href.startswith("http") and label:
+            links.append({"label": label, "url": href})
+
+    # Categorize known link types
+    categorized = {}
+    for link in links:
+        u = link["url"].lower()
+        l = link["label"].lower()
+        if "r2.dev" in u or "cloud direct" in l:
+            categorized["cloud_direct"] = link["url"]
+        elif "fffast.filesdl" in u or "10gbps" in l or "direct download" in l:
+            categorized["direct_download"] = link["url"]
+        elif "pixeldrain" in u or "pixeldrain" in l:
+            categorized["pixeldrain"] = link["url"]
+        elif "hubcloud" in u or "hubcloud" in l:
+            categorized["hubcloud"] = link["url"]
+        elif "gdflix" in u or "gdflix" in l:
+            categorized["gdflix"] = link["url"]
+        elif "gofile" in u or "gofile" in l:
+            categorized["gofile"] = link["url"]
+        elif "fuckingfast" in u or "buzz" in l:
+            categorized["buzz"] = link["url"]
+        elif "bmf.filesdl" in u or "slowcloud" in l:
+            categorized["slowcloud"] = link["url"]
+
+    return {
+        "success": True,
+        "source_url": url,
+        "filename": filename,
+        "size": size,
+        "date": date,
+        "links": categorized,
+        "all_links": links,
+    }
+
+
 # ── Endpoints ──────────────────────────────────
 @app.get("/")
 async def root():
     return {
         "status": "online",
         "service": "CF Bypass Scraper API (Free Tier)",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "engine": "cloudscraper",
         "endpoints": {
+            "filesdl":      "GET  /filesdl?url=https://new1.filesdl.in/cloud/xxx",
             "browser_test": "GET  /target?url=https://site.com",
             "scrape":       "POST /scrape",
             "batch":        "POST /scrape/batch",
@@ -179,6 +244,29 @@ async def health():
     return {"status": "healthy", "timestamp": int(time.time())}
 
 
+# ── /filesdl — dedicated filesdl parser ────────
+@app.get("/filesdl")
+async def filesdl_get(url: str, timeout: int = 30):
+    if not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="url must start with http:// or https://")
+
+    start = time.time()
+    req = ScrapeRequest(url=url, return_html=True, timeout=timeout)
+    result = await scrape_async(req)
+
+    if not result.get("success"):
+        return JSONResponse(content={
+            "success": False,
+            "error": result.get("error"),
+            "elapsed_ms": int((time.time() - start) * 1000),
+        })
+
+    parsed = parse_filesdl(result["html"], url)
+    parsed["elapsed_ms"] = int((time.time() - start) * 1000)
+    return JSONResponse(content=parsed)
+
+
+# ── /target — browser friendly generic ─────────
 @app.get("/target")
 async def target_get(
     url: str,
