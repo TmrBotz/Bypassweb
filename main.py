@@ -1,7 +1,6 @@
 """
 CF Bypass Scraper API — Free Tier Edition
-cloudscraper only, no browser, Render Free compatible
-Pydantic v1 + html.parser (no lxml/Rust needed)
+cloudscraper only, Render Free compatible
 """
 
 import asyncio
@@ -36,7 +35,7 @@ BROWSER_PROFILES = [
 ]
 
 DEFAULT_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
@@ -46,7 +45,7 @@ DEFAULT_HEADERS = {
 app = FastAPI(
     title="CF Bypass Scraper API",
     description="Cloudflare bypass via cloudscraper — Render Free compatible",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 app.add_middleware(
@@ -57,7 +56,7 @@ app.add_middleware(
 )
 
 
-# ── Models (Pydantic v1 style) ─────────────────
+# ── Models ─────────────────────────────────────
 class ScrapeRequest(BaseModel):
     url: str
     method: str = "GET"
@@ -69,6 +68,7 @@ class ScrapeRequest(BaseModel):
     return_text: bool = False
     return_json: bool = False
     timeout: int = 30
+
 
 class BatchRequest(BaseModel):
     urls: list
@@ -99,19 +99,18 @@ def _do_scrape(req: ScrapeRequest) -> dict:
             resp = scraper.get(req.url, timeout=req.timeout)
 
         if resp.status_code == 403 and "cloudflare" in resp.text.lower():
-            return {"success": False, "error": "CF 403 blocked — site needs Turnstile bypass (paid plan)", "status_code": 403}
+            return {"success": False, "error": "CF 403 blocked", "status_code": 403}
         if resp.status_code == 503 and "Just a moment" in resp.text:
-            return {"success": False, "error": "CF 503 IUAM — cloudscraper could not bypass", "status_code": 503}
+            return {"success": False, "error": "CF 503 IUAM — bypass failed", "status_code": 503}
 
         html = resp.text
-        result = {
+        result: dict = {
             "success": True,
             "status_code": resp.status_code,
             "html": html,
             "cookies": dict(scraper.cookies),
         }
 
-        # CSS Extraction (html.parser — no lxml needed)
         if req.extract_selector:
             try:
                 soup = BeautifulSoup(html, "html.parser")
@@ -119,9 +118,7 @@ def _do_scrape(req: ScrapeRequest) -> dict:
                 result["extracted"] = "\n".join(e.get_text(strip=True) for e in elems) if elems else None
             except Exception as e:
                 result["extracted"] = None
-                logger.warning(f"CSS extract failed: {e}")
 
-        # Plain text
         if req.return_text:
             try:
                 soup = BeautifulSoup(html, "html.parser")
@@ -129,10 +126,9 @@ def _do_scrape(req: ScrapeRequest) -> dict:
                     tag.decompose()
                 text = soup.get_text(separator="\n", strip=True)
                 result["text"] = re.sub(r"\n{3,}", "\n\n", text)
-            except Exception as e:
+            except Exception:
                 result["text"] = None
 
-        # JSON parse
         if req.return_json:
             try:
                 result["json_data"] = json.loads(html)
@@ -167,7 +163,7 @@ async def root():
     return {
         "status": "online",
         "service": "CF Bypass Scraper API (Free Tier)",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "engine": "cloudscraper",
         "endpoints": {
             "browser_test": "GET  /target?url=https://site.com",
@@ -201,7 +197,6 @@ async def target_get(
         return_text=text,
         timeout=timeout,
     )
-
     result = await scrape_async(req)
     result["elapsed_ms"] = int((time.time() - start) * 1000)
     result["url"] = url
